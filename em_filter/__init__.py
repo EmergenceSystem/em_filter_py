@@ -1,4 +1,5 @@
 from .config import AgentConfig, DiscoNode
+from .identity import Identity
 from .runner import FilterRunner
 from .html import (
     strip_scripts,
@@ -12,6 +13,7 @@ from .html import (
 __all__ = [
     "AgentConfig",
     "DiscoNode",
+    "Identity",
     "FilterRunner",
     "strip_scripts",
     "get_text",
