@@ -55,3 +55,9 @@ def verify(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
         return True
     except (BadSignatureError, ValueError):
         return False
+
+import base64 as _b64
+
+def sign_response(items, pubkey: bytes, seed: bytes) -> tuple[str, str]:
+    sig = sign(canonical_response(items), seed)
+    return _b64.b64encode(id_of(pubkey)).decode(), _b64.b64encode(sig).decode()
