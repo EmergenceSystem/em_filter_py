@@ -4,44 +4,62 @@
 
 Python SDK for building [Emergence](https://github.com/EmergenceSystem) network agents.
 
-`em_filter_py` lets any Python process join the Emergence distributed discovery network
-as a **filter agent** — a service that receives search queries from the `em_disco`
-broker, processes them (web search, DNS lookup, LLM call, database query, …), and
-returns structured results.
+`em_filter_py` lets any Python process join the Emergence discovery mesh as a
+**filter agent** — a service that receives search queries from `em_pop` /
+`em_disco`, processes them (web search, DNS lookup, LLM call, database
+query, …), and returns **signed, structured results**.
 
-This library is the Python equivalent of the Erlang `em_filter` library: same WebSocket
-protocol, same configuration contract, idiomatic Python API.
+This is the reference SDK for the current signed mesh protocol: ed25519
+identity, byte-identical canonical forms to the Erlang `em_pop_crypto`
+reference, and both transports the mesh supports. See [PROTOCOL.md](PROTOCOL.md)
+for the wire-level detail.
 
 ---
 
 ## How it works
 
-```
- ┌─────────────┐    WebSocket     ┌───────────────┐    WebSocket     ┌─────────────┐
- │  em_disco   │ ◄─────────────── │ FilterRunner  │ ───────────────► │  em_disco   │
- │  (broker)   │  query / result  │ (your agent)  │  (multi-node)    │  (replica)  │
- └─────────────┘                  └───────────────┘                  └─────────────┘
-                                         │
-                               threading.Thread per node
-                                         │
-                                  ┌──────┴──────┐
-                                  │ your handler│
-                                  │  function   │
-                                  └─────────────┘
-```
+Every agent has an ed25519 keypair (`node_ed25519.key`, created on first run)
+and signs every result it returns. The mesh verifies that signature against
+the agent's gossip-bound public key, so a relay hop can never forge a result.
 
-1. `FilterRunner` resolves disco nodes and spawns one thread per node.
-2. Each thread maintains a persistent WebSocket connection with automatic reconnection.
-3. On a `query` frame, the thread calls your handler and sends back a `result` frame.
+Two transports, selected by `EM_FILTER_MODE`:
+
+- **`relay` (default, NAT-friendly)** — the SDK opens one outbound WebSocket
+  to `wss://<disco>/ws/filter` and never needs an inbound port. The disco
+  relays queries to it and forwards its signed results unchanged.
+- **`direct`** — the SDK runs a small HTTP server (`/agent/query`,
+  `/pop/gossip`, `/health`) and periodically gossips its own signed
+  self-payload to each configured seed, so Emquest can query it directly at
+  `host:query_port`.
+- **`both`** — runs the HTTP server + gossip loop *and* the relay WS
+  concurrently, under the same identity (the direct path takes priority when
+  reachable; relay is a NAT-friendly fallback).
+
+```
+                          EM_FILTER_MODE=relay (default)
+ ┌──────────┐   outbound WS "hello"    ┌───────────────┐
+ │  disco   │ ◄──────────────────────  │ FilterRunner  │
+ │ /ws/filter│  "query" / "result"  ──► │ (your agent)  │
+ └──────────┘                          └───────────────┘
+
+                          EM_FILTER_MODE=direct
+ ┌──────────┐  POST /pop/gossip (self-payload, every 5s)
+ │  disco   │ ◄──────────────────────  ┌───────────────┐
+ └──────────┘                          │ FilterRunner  │
+ ┌──────────┐  POST /agent/query       │ (HTTP server) │
+ │ Emquest  │ ───────────────────────► └───────────────┘
+ └──────────┘  ◄── signed results
+```
 
 ---
 
 ## Requirements
 
-Python 3.9+ and [`websocket-client`](https://pypi.org/project/websocket-client/):
+Python 3.10+, [`pynacl`](https://pypi.org/project/pynacl/) (ed25519) and
+[`websocket-client`](https://pypi.org/project/websocket-client/) (relay mode):
 
 ```bash
-pip install websocket-client
+pip install -e ".[dev]"   # or: pip install pynacl websocket-client
 ```
 
 ---
@@ -51,97 +69,63 @@ pip install websocket-client
 ```python
 from em_filter import FilterRunner
 
-class MyFilter:
-    def handle(self, body: str, memory: dict) -> tuple:
-        result = [{
-            "type": "url",
-            "properties": {
-                "url":   "https://example.com",
-                "title": f"Result for: {body}",
-            }
-        }]
-        return result, memory
-
-    def capabilities(self) -> list[str]:
-        return ["search", "query"]
+def handle(body: str, memory: dict) -> tuple:
+    results = [{
+        "url": "https://example.com",
+        "title": f"Result for: {body}",
+        "resume": f"Handled query: {body}",
+    }]
+    return results, memory
 
 if __name__ == "__main__":
-    FilterRunner("my_filter", MyFilter()).run()
+    FilterRunner("my_filter", handle, capabilities=["search", "query"]).run()
 ```
 
-By default the agent connects to `localhost:8080`. Override via environment
-variables or `AgentConfig` — see [Configuration](#configuration).
+By default the agent runs in `relay` mode against `localhost:8080`. Override
+via environment variables or an `AgentConfig` — see [Configuration](#configuration).
+
+A handler can also be an object with a `handle(self, body, memory)` method
+and an optional `capabilities(self)` method, instead of a plain function.
 
 ---
 
 ## Try the built-in example
 
 ```bash
-python examples/echo_filter.py
-```
-
-Expected output once connected:
-
-```
-[em_filter] echo_filter connecting to ws://localhost:8080/ws
-[em_filter] echo_filter registered — entering message loop
+python examples/echo_filter.py                                        # relay (default)
+EM_FILTER_MODE=direct EM_FILTER_QUERY_PORT=9600 python examples/echo_filter.py  # direct
 ```
 
 With a custom broker:
 
 ```bash
-EM_DISCO_HOST=disco.example.com \
-EM_DISCO_PORT=443 \
-EM_FILTER_JWT_TOKEN=eyJ... \
-python examples/echo_filter.py
+EM_DISCO_HOST=disco.example.com EM_DISCO_PORT=443 python examples/echo_filter.py
 ```
 
 ---
 
 ## The handler contract
 
-The handler can be any object with a `handle` method — no base class required:
+`handle(body, memory)` returns `(result, new_memory)`. `result` is a
+JSON-serialisable list of items — either flat or with a `properties`
+sub-object — read by the shared `canonical_response` signer:
 
-```python
-class MyFilter:
-    def handle(self, body: str, memory: dict) -> tuple:
-        # body:   raw query string, e.g. "erlang otp"
-        # memory: persists between queries within a connection (resets on reconnect)
-        new_memory = {**memory, "last_query": body}
-        result = [{"type": "text", "properties": {"content": f"Processed: {body}"}}]
-        return result, new_memory
+| Field | Read from (first match wins) |
+|-------|-------------------------------|
+| URL   | `url` |
+| Title | `title`, `label` |
+| Resume | `resume`, `value`, `description` |
 
-    def capabilities(self) -> list[str]:
-        # em_disco uses these to route queries to this agent
-        return ["search", "query", "my_capability"]
-```
-
-A plain callable is also accepted:
-
-```python
-def my_handler(body: str, memory: dict) -> tuple:
-    return [{"type": "text", "properties": {"content": body}}], memory
-
-FilterRunner("my_filter", my_handler).run()
-```
-
-### Result format
-
-`handle` returns `(result, new_memory)`. `result` is a JSON-serialisable value —
-typically a list of **embryo** objects:
-
-| Type | Required properties |
-|------|---------------------|
-| `"url"` | `url`, `title` |
-| `"dns"` | `domain`, `ips` |
-| `"text"` | `content` |
-
-An empty list `[]` or `None` means "no results for this query".
+An empty list `[]` (or `None`) means "no results for this query". Every
+non-empty `result` your handler returns is signed automatically before it
+leaves the SDK — you never construct the signature yourself.
 
 ### Capabilities
 
-`capabilities()` returns the list of capabilities your agent advertises.
-`em_disco` uses this to route queries. Default: `["search", "query"]`.
+Advertised capabilities route queries to your agent (§5 of the mesh spec).
+Pass them explicitly (`FilterRunner(..., capabilities=[...])`), via a
+handler object's `capabilities()` method, or accept the default
+`["search", "query"]`.
 
 ---
 
@@ -151,10 +135,13 @@ An empty list `[]` or `None` means "no results for this query".
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EM_DISCO_HOST` | — | Disco broker hostname |
-| `EM_DISCO_PORT` | — | Disco broker port |
-| `EM_FILTER_JWT_TOKEN` | — | JWT for authenticated brokers |
-| `EM_FILTER_RECONNECT_MS` | `5000` | Reconnect delay in milliseconds |
+| `EM_FILTER_MODE` | `relay` | `relay` \| `direct` \| `both` |
+| `EM_FILTER_KEY_DIR` | `./empop_key_<name>/` | Directory holding `node_ed25519.key` |
+| `EM_FILTER_QUERY_PORT` | `9600` | Direct-mode HTTP listen port |
+| `EM_FILTER_ADVERTISE_HOST` | `0.0.0.0` | Direct-mode host advertised in gossip |
+| `EM_FILTER_GOSSIP_INTERVAL_S` | `5` | Direct-mode gossip push interval (seconds) |
+| `EM_DISCO_HOST` | — | Disco/pop hostname |
+| `EM_DISCO_PORT` | — | Disco/pop port |
 
 ### Node resolution order
 
@@ -163,13 +150,16 @@ An empty list `[]` or `None` means "no results for this query".
 3. `[em_disco] nodes = …` in `emergence.conf`
 4. `localhost:8080` — built-in default
 
+Relay mode connects to the *first* resolved node; direct mode gossips to
+*every* resolved node (its seed list).
+
 ### TLS inference
 
 | Host | Port | Transport |
 |------|------|-----------|
-| `localhost`, `127.0.0.1`, `::1` | any | `ws://` (plain) |
-| any other | 443 | `wss://` (TLS) |
-| any other | other | `ws://` (plain) |
+| `localhost`, `127.0.0.1`, `::1` | any | `ws://` / `http://` (plain) |
+| any other | 443 | `wss://` / `https://` (TLS) |
+| any other | other | `ws://` / `http://` (plain) |
 
 ### `emergence.conf`
 
@@ -188,22 +178,21 @@ Platform paths:
 from em_filter import FilterRunner, AgentConfig, DiscoNode
 
 config = AgentConfig(
-    jwt_token="eyJ...",
-    disco_nodes=[
-        DiscoNode(host="disco.example.com",  port=443, tls=True),
-        DiscoNode(host="disco2.example.com", port=443, tls=True),
-    ],
+    disco_nodes=[DiscoNode(host="disco.example.com", port=443, tls=True)],
 )
-FilterRunner("my_filter", MyFilter(), config).run()
+FilterRunner("my_filter", handle, config=config, mode="direct").run()
 ```
 
 ---
 
-## Multi-node
+## Identity & signing
 
-`FilterRunner` connects to all resolved nodes simultaneously, one thread per node.
-Memory is local to each connection — each thread starts with an empty dict on connect
-and resets on reconnect (same as Erlang `em_filter` RAM mode).
+Every agent has an ed25519 keypair, persisted as `node_ed25519.key`
+(`pubkey(32 bytes) ‖ privkey(32 bytes)`) — portable across every Emergence
+SDK implementation. `em_filter.Identity` builds and signs the wire payloads;
+`em_filter.crypto` is the low-level, fixture-verified module (`id_of`,
+`canonical_identity`, `canonical_response`, `sign`, `verify`,
+`sign_response`) shared by both transports. See [PROTOCOL.md](PROTOCOL.md).
 
 ---
 
@@ -225,27 +214,6 @@ href   = extract_attribute('<a href="/page">link</a>', "href")  # → "/page"
 decoded = decode_html_entities("caf&eacute; &amp; croissant")   # → "café & croissant"
 skip   = should_skip_link("https://ads.example.com", ["ads.example.com"])  # → True
 ```
-
----
-
-## WebSocket protocol
-
-The agent speaks a minimal JSON-over-WebSocket protocol to `em_disco`.
-
-**Agent → Disco:**
-```json
-{ "action": "register",    "name": "<agent_name>" }
-{ "action": "agent_hello", "capabilities": ["search", "query"] }
-{ "action": "result",      "id": "<query_id>", "data": <result> }
-```
-
-**Disco → Agent:**
-```json
-{ "action": "query", "id": "<query_id>", "body": "<query_string>" }
-```
-
-The library handles the handshake and reconnection automatically.
-Your code only implements the handler.
 
 ---
 
