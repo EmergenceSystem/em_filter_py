@@ -20,3 +20,38 @@ def load_or_create(key_dir: str | os.PathLike) -> tuple[bytes, bytes]:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(pub + seed)
     return pub, seed
+
+from nacl.exceptions import BadSignatureError
+
+def canonical_identity(id_bytes: bytes, name: str) -> bytes:
+    return id_bytes + b"\x00" + name.encode("utf-8")
+
+def _pick(props: dict, keys: list[str]) -> bytes:
+    for k in keys:
+        v = props.get(k)
+        if isinstance(v, str):
+            return v.encode("utf-8")
+    return b""
+
+def _item_line(item) -> bytes:
+    props = item.get("properties") if isinstance(item, dict) else None
+    p = props if isinstance(props, dict) else (item if isinstance(item, dict) else {})
+    u = _pick(p, ["url"])
+    t = _pick(p, ["title", "label"])
+    r = _pick(p, ["resume", "value", "description"])
+    return u + b"\x00" + t + b"\x00" + r + b"\n"
+
+def canonical_response(items) -> bytes:
+    if not isinstance(items, list):
+        return b""
+    return b"".join(_item_line(i) for i in items)
+
+def sign(msg: bytes, seed: bytes) -> bytes:
+    return SigningKey(seed).sign(msg).signature  # 64 bytes
+
+def verify(msg: bytes, sig: bytes, pubkey: bytes) -> bool:
+    try:
+        VerifyKey(pubkey).verify(msg, sig)
+        return True
+    except (BadSignatureError, ValueError):
+        return False
