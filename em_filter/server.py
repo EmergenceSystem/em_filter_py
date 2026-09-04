@@ -1,7 +1,9 @@
 # em_filter/server.py
 from __future__ import annotations
-import json, threading
+import json, logging, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+log = logging.getLogger(__name__)
 
 
 class AgentServer:
@@ -62,3 +64,45 @@ class AgentServer:
 
     def stop(self):
         self._server.shutdown()
+
+
+class GossipPusher:
+    """Model A: periodically POSTs this identity's gossip payload to each
+    seed disco node's /pop/gossip, so it is discoverable for direct queries."""
+
+    def __init__(self, identity, seeds: list[str], host: str, query_port: int,
+                 interval: float = 10.0):
+        self.identity = identity
+        self.seeds = seeds
+        self.host = host
+        self.query_port = query_port
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _push_once(self):
+        payload = json.dumps(self.identity.gossip_payload(
+            host=self.host, query_port=self.query_port)).encode()
+        for seed in self.seeds:
+            url = f"http://{seed}/pop/gossip"
+            req = urllib.request.Request(
+                url, data=payload, method="POST",
+                headers={"content-type": "application/json"})
+            try:
+                urllib.request.urlopen(req, timeout=5).read()
+            except urllib.error.URLError as e:
+                log.warning("gossip push to %s failed: %s", seed, e)
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._push_once()
+            self._stop.wait(self.interval)
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
